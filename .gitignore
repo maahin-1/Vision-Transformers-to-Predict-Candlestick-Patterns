@@ -33,3 +33,4 @@ test_live_preds_cached/
 
 # Playwright MCP scratch
 .playwright-mcp/
+logs/

@@ -42,6 +42,7 @@ The page shows:
 - a rule check, using textbook OHLC definitions, saying whether it agrees with the model;
 - "What the model sees", the exact 72 x 104 px crop fed to the network;
 - the OHLCV table of those eight candles, so you can compare against Yahoo or your broker.
+- a detection history (newest 10 rows) with a **Download CSV** button. Every new candle's prediction is appended to `logs/detections.csv` (time, ticker, mode, close, model class and confidence, rule patterns, whether they agree), so you can review how the model behaved later. The `logs/` folder is git-ignored.
 
 Press `Ctrl+C` in the terminal to stop.
 
@@ -85,6 +86,7 @@ uv run pytest
 ```
 src/app.py                  Dash app: ticker input, chart, prediction, rule check
 src/market.py               Yahoo Finance data and market status
+src/history.py              CSV log of every prediction
 src/render.py               draws the 20-candle chart image the model expects
 src/predictor.py            loads the ViT and runs inference
 src/rules.py                OHLC definitions of the five patterns

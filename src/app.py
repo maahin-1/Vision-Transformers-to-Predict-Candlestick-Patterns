@@ -13,9 +13,10 @@ import threading
 import time
 
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, ctx, dcc, html
+from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 from PIL import Image
 
+import history
 import market
 import predictor
 import render
@@ -28,6 +29,7 @@ REPLAY_MS = 1_000
 MODEL_WINDOW = 8  # candles the ViT crop covers
 START_TICKER = 'AMZN'
 
+HISTORY = history.HistoryLog()
 _lock = threading.Lock()
 S = {'ticker': None, 'mode': 'live', 'df': None, 'cursor': 0, 'fetched': 0.0, 'warning': '', 'error': '', 'cache': (None, None)}
 
@@ -64,6 +66,15 @@ app.layout = html.Div(style=PAGE, children=[
         html.Div(f'Last {MODEL_WINDOW} candles (the ones the model reads) - compare with Yahoo or your broker',
                  style={'fontWeight': 600, 'marginBottom': '8px'}),
         html.Div(id='table'),
+    ]),
+    html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
+        html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center',
+                        'marginBottom': '8px'}, children=[
+            html.Div('Detection history (logged to logs/detections.csv)', style={'fontWeight': 600}),
+            html.Button('Download CSV', id='export-btn', n_clicks=0, style={'padding': '4px 12px', 'cursor': 'pointer'}),
+            dcc.Download(id='export-download'),
+        ]),
+        html.Div(id='history'),
     ]),
     html.Div('Educational demo, not financial advice. The model has no "no pattern" class: it always picks one of '
              'five, so read the confidence and the rule check.',
@@ -147,9 +158,12 @@ def _prediction_panel(probs):
     return rows, CLASSES[top]
 
 
-def _rule_panel(visible, top_class):
+def _found(visible):
     candles = [tuple(r) for r in visible[['Open', 'High', 'Low', 'Close']].tail(3).itertuples(index=False)]
-    found = rules.detect(candles)
+    return rules.detect(candles)
+
+
+def _rule_panel(found, top_class):
     if not found:
         return [html.Span('Rule check: no textbook pattern on the newest candles. ', style={'fontWeight': 600}),
                 html.Span(f'Model says {top_class}; treat as low-signal.', style={'color': '#6b7280'})]
@@ -171,15 +185,26 @@ def _table(visible):
     return html.Table([html.Thead(head), html.Tbody(body)], style={'borderCollapse': 'collapse', 'fontSize': '14px'})
 
 
+def _history_table():
+    rows = HISTORY.recent(10)
+    if not rows:
+        return html.Div('Nothing logged yet.', style={'color': '#6b7280', 'fontSize': '14px'})
+    cols = [('candle_time', 'Candle'), ('ticker', 'Ticker'), ('mode', 'Mode'), ('close', 'Close'),
+            ('prediction', 'Model'), ('confidence', 'Conf.'), ('rule_patterns', 'Rules'), ('agrees', 'Agree')]
+    head = html.Tr([html.Th(label, style={'textAlign': 'left', 'padding': '4px 10px'}) for _, label in cols])
+    body = [html.Tr([html.Td(r[key] or '-', style={'padding': '4px 10px'}) for key, _ in cols]) for r in rows]
+    return html.Table([html.Thead(head), html.Tbody(body)], style={'borderCollapse': 'collapse', 'fontSize': '13px'})
+
+
 def _message(text, interval):
     empty = go.Figure().update_layout(template='plotly_white', xaxis_visible=False, yaxis_visible=False)
-    return empty, html.Span(text, style={'color': '#b91c1c', 'fontWeight': 600}), '', '', '', '', interval
+    return empty, html.Span(text, style={'color': '#b91c1c', 'fontWeight': 600}), '', '', '', '', interval, no_update
 
 
 @app.callback(
     Output('chart', 'figure'), Output('status', 'children'), Output('prediction', 'children'),
     Output('rule-check', 'children'), Output('model-view', 'src'), Output('table', 'children'),
-    Output('tick', 'interval'),
+    Output('tick', 'interval'), Output('history', 'children'),
     Input('tick', 'n_intervals'), Input('track-btn', 'n_clicks'), Input('ticker-input', 'n_submit'),
     Input('mode', 'value'), State('ticker-input', 'value'),
 )
@@ -211,8 +236,16 @@ def refresh(_n, _clicks, _submit, mode, ticker_text):
             return _message(str(exc), interval)
 
         panel, top_class = _prediction_panel(probs)
-        return (_figure(visible), _status(visible), panel, _rule_panel(visible, top_class), src, _table(visible),
-                interval)
+        found = _found(visible)
+        HISTORY.log(S['ticker'], S['mode'], visible['Datetime'].iloc[-1], visible['Close'].iloc[-1], top_class,
+                    max(probs), found)
+        return (_figure(visible), _status(visible), panel, _rule_panel(found, top_class), src, _table(visible),
+                interval, _history_table())
+
+
+@app.callback(Output('export-download', 'data'), Input('export-btn', 'n_clicks'), prevent_initial_call=True)
+def export_history(_clicks):
+    return dcc.send_file(HISTORY.path) if HISTORY.exists() else no_update
 
 
 if __name__ == '__main__':
