@@ -1,0 +1,35 @@
+[project]
+name = "vit-candlestick-patterns"
+version = "1.0.0"
+description = "Vision Transformer model for predicting candlestick patterns in financial charts"
+readme = "README.md"
+authors = [{name = "Maahin Bir Singh Osahan", email = "maahinosahan123@gmail.com"}]
+requires-python = ">=3.13"
+dependencies = [
+    "albumentations>=2.0.8",
+    "colorama>=0.4.6",
+    "dash>=3.0.4",
+    "einops>=0.8.1",
+    "matplotlib>=3.10.3",
+    "mss>=10.0.0",
+    "numpy>=2.3.0",
+    "opencv-python<=4.11.0",
+    "pillow>=11.2.1",
+    "plotly>=6.1.2",
+    "scikit-learn>=1.7.0",
+    "torch>=2.7.1",
+    "torchinfo>=1.8.0",
+    "torchvision>=0.22.1",
+    "yfinance>=0.2.63",
+]
+
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

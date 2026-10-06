@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info
+.DS_Store
+
+# Virtual environments
+.venv
+
+# Build and dist
+build/
+dist/
+wheels/
+
+# Large files and model checkpoints
+checkpoints/
+*.pt
+*.pth
+
+# Data artifacts
+archive/
+data.zip
+transformed_images/
+test_cap_test/
+test_cap_train/
+test_live_preds_cached/
+
+# IDE and notebooks
+.ipynb_checkpoints/
+*.ipynb
+.vscode/
+.idea/
