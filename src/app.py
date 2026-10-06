@@ -13,7 +13,7 @@ import threading
 import time
 
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
+from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 from PIL import Image
 
 import history
@@ -21,8 +21,9 @@ import market
 import predictor
 import render
 import rules
+import scanner
 
-CLASSES = predictor.CLASSES
+CLASSES = rules.CLASSES
 COLORS = ['#ebdc9c', '#8ccfa6', '#c1abec', '#e8a3ca', '#ff8080']
 LIVE_POLL_MS = 30_000
 REPLAY_MS = 1_000
@@ -30,7 +31,8 @@ MODEL_WINDOW = 8  # candles the ViT crop covers
 START_TICKER = 'AMZN'
 
 HISTORY = history.HistoryLog()
-_lock = threading.Lock()
+_lock = threading.Lock()  # guards S and HISTORY
+_infer_lock = threading.Lock()  # one forward pass at a time
 S = {'ticker': None, 'mode': 'live', 'df': None, 'cursor': 0, 'fetched': 0.0, 'warning': '', 'error': '', 'cache': (None, None)}
 
 app = Dash(__name__, title='Candlestick Pattern Tracker')
@@ -63,6 +65,18 @@ app.layout = html.Div(style=PAGE, children=[
         ]),
     ]),
     html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
+        html.Div('Watchlist scanner', style={'fontWeight': 600, 'marginBottom': '8px'}),
+        html.Div(style={'display': 'flex', 'gap': '10px', 'alignItems': 'center', 'flexWrap': 'wrap'}, children=[
+            dcc.Input(id='scan-input', type='text', value='AAPL, MSFT, TSLA, NVDA, AMZN',
+                      placeholder=f'Up to {scanner.MAX_TICKERS} tickers, comma separated',
+                      style={'padding': '6px 10px', 'width': '380px', 'fontSize': '15px'}),
+            html.Button('Scan', id='scan-btn', n_clicks=0, style={'padding': '6px 16px', 'cursor': 'pointer'}),
+            dcc.Checklist(id='scan-auto', value=[], options=[{'label': ' Auto-refresh every 30 s', 'value': 'auto'}]),
+            html.Span(id='scan-status', style={'fontSize': '13px', 'color': '#6b7280'}),
+        ]),
+        html.Div(id='scan-results', style={'marginTop': '10px'}),
+    ]),
+    html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
         html.Div(f'Last {MODEL_WINDOW} candles (the ones the model reads) - compare with Yahoo or your broker',
                  style={'fontWeight': 600, 'marginBottom': '8px'}),
         html.Div(id='table'),
@@ -80,7 +94,14 @@ app.layout = html.Div(style=PAGE, children=[
              'five, so read the confidence and the rule check.',
              style={'marginTop': '12px', 'fontSize': '12px', 'color': '#6b7280'}),
     dcc.Interval(id='tick', interval=REPLAY_MS, n_intervals=0),
+    dcc.Interval(id='scan-tick', interval=LIVE_POLL_MS, n_intervals=0, disabled=True),
+    dcc.Store(id='open-ticker'),
 ])
+
+
+def _infer(image):
+    with _infer_lock:
+        return predictor.predict(image)
 
 
 def _start(ticker_text, mode):
@@ -134,7 +155,7 @@ def _predict(visible):
         return S['cache'][1]
     data = visible.iloc[-render.N_CANDLES:]
     image = render.render_chart(data['Open'], data['High'], data['Low'], data['Close'], list(data['Datetime']))
-    probs = predictor.predict(image)
+    probs = _infer(image)
     view = Image.fromarray(predictor.model_view(image)).resize((216, 312), Image.Resampling.NEAREST)
     buf = io.BytesIO()
     view.save(buf, format='PNG')
@@ -156,11 +177,6 @@ def _prediction_panel(probs):
             html.Div(f'{name}  {probs[i]:.3f}', style={'position': 'absolute', 'left': '8px', 'top': '3px',
                                                        'fontSize': '13px'})]))
     return rows, CLASSES[top]
-
-
-def _found(visible):
-    candles = [tuple(r) for r in visible[['Open', 'High', 'Low', 'Close']].tail(3).itertuples(index=False)]
-    return rules.detect(candles)
 
 
 def _rule_panel(found, top_class):
@@ -206,14 +222,18 @@ def _message(text, interval):
     Output('rule-check', 'children'), Output('model-view', 'src'), Output('table', 'children'),
     Output('tick', 'interval'), Output('history', 'children'),
     Input('tick', 'n_intervals'), Input('track-btn', 'n_clicks'), Input('ticker-input', 'n_submit'),
-    Input('mode', 'value'), State('ticker-input', 'value'),
+    Input('mode', 'value'), Input('open-ticker', 'data'), State('ticker-input', 'value'),
 )
-def refresh(_n, _clicks, _submit, mode, ticker_text):
+def refresh(_n, _clicks, _submit, mode, opened, ticker_text):
     with _lock:
         interval = LIVE_POLL_MS if mode == 'live' else REPLAY_MS
         trigger = ctx.triggered_id
+        if trigger == 'open-ticker':
+            ticker_text = opened['ticker']
         try:
-            if trigger in ('track-btn', 'ticker-input', 'mode') or (S['df'] is None and not S['error']):
+            # A page load (no trigger) or a mode mismatch re-syncs the server with what the page shows
+            if (trigger in (None, 'track-btn', 'ticker-input', 'mode', 'open-ticker') or S['mode'] != mode
+                    or (S['df'] is None and not S['error'])):
                 S['error'] = ''
                 _start(ticker_text, mode)
             elif S['df'] is None:  # last attempt failed; wait for the user instead of hammering Yahoo
@@ -236,7 +256,7 @@ def refresh(_n, _clicks, _submit, mode, ticker_text):
             return _message(str(exc), interval)
 
         panel, top_class = _prediction_panel(probs)
-        found = _found(visible)
+        found = rules.detect_frame(visible)
         HISTORY.log(S['ticker'], S['mode'], visible['Datetime'].iloc[-1], visible['Close'].iloc[-1], top_class,
                     max(probs), found)
         return (_figure(visible), _status(visible), panel, _rule_panel(found, top_class), src, _table(visible),
@@ -246,6 +266,77 @@ def refresh(_n, _clicks, _submit, mode, ticker_text):
 @app.callback(Output('export-download', 'data'), Input('export-btn', 'n_clicks'), prevent_initial_call=True)
 def export_history(_clicks):
     return dcc.send_file(HISTORY.path) if HISTORY.exists() else no_update
+
+
+def _scan_table(rows):
+    cols = ['Ticker', 'Model', 'Conf.', 'Rules', 'Agree', 'Market', 'Last candle', 'Close', '']
+    head = html.Tr([html.Th(c, style={'textAlign': 'left', 'padding': '4px 10px'}) for c in cols])
+    body = []
+    for r in rows:
+        button = html.Button('Open', id={'type': 'open-ticker', 'ticker': r['ticker']}, n_clicks=0,
+                             style={'cursor': 'pointer'})
+        cell = {'padding': '4px 10px'}
+        if r['error']:
+            body.append(html.Tr([html.Td(r['ticker'], style={**cell, 'fontWeight': 600}),
+                                 html.Td(r['error'], colSpan=7, style={**cell, 'color': '#b91c1c'}),
+                                 html.Td(button, style=cell)]))
+            continue
+        tint = '#ecfdf5' if r['agrees'] else 'transparent'
+        body.append(html.Tr(style={'background': tint}, children=[
+            html.Td(r['ticker'], style={**cell, 'fontWeight': 600}),
+            html.Td(r['prediction'], style={**cell, 'background': COLORS[CLASSES.index(r['prediction'])]}),
+            html.Td(f"{r['confidence']:.1%}", style=cell),
+            html.Td(', '.join(r['rules']) or '-', style=cell),
+            html.Td('yes' if r['agrees'] else 'no', style=cell),
+            html.Td(r['market'], style=cell),
+            html.Td(f"{r['candle_time']:%m-%d %H:%M}", style=cell),
+            html.Td(f"{r['close']:,.2f}", style=cell),
+            html.Td(button, style=cell),
+        ]))
+    return html.Table([html.Thead(head), html.Tbody(body)], style={'borderCollapse': 'collapse', 'fontSize': '14px'})
+
+
+@app.callback(Output('scan-results', 'children'), Output('scan-status', 'children'),
+              Input('scan-btn', 'n_clicks'), Input('scan-tick', 'n_intervals'), State('scan-input', 'value'),
+              prevent_initial_call=True)
+def run_scan(_clicks, _n, text):
+    tickers, rejected, truncated = scanner.parse_tickers(text)
+    notes = []
+    if rejected:
+        notes.append(f"ignored: {', '.join(rejected)}")
+    if truncated:
+        notes.append(f'only the first {scanner.MAX_TICKERS} are scanned')
+    if not tickers:
+        return no_update, 'Enter at least one valid ticker.'
+    started = time.monotonic()
+    rows = scanner.scan(tickers, _infer)
+    with _lock:
+        for r in rows:
+            if not r['error']:
+                HISTORY.log(r['ticker'], 'scan', r['candle_time'], r['close'], r['prediction'], r['confidence'],
+                            r['rules'])
+    ok = sum(1 for r in rows if not r['error'])
+    status = f'{ok}/{len(rows)} scanned in {time.monotonic() - started:.1f} s at {time.strftime("%H:%M:%S")}'
+    return _scan_table(rows), '  |  '.join([status] + notes)
+
+
+@app.callback(Output('scan-tick', 'disabled'), Input('scan-auto', 'value'))
+def toggle_auto_scan(value):
+    return 'auto' not in (value or [])
+
+
+@app.callback(Output('open-ticker', 'data'), Input({'type': 'open-ticker', 'ticker': ALL}, 'n_clicks'),
+              prevent_initial_call=True)
+def open_ticker(_clicks):
+    trigger = ctx.triggered[0] if ctx.triggered else None
+    if not trigger or not trigger['value']:  # re-rendered buttons start at 0 and must not count as clicks
+        return no_update
+    return {'ticker': ctx.triggered_id['ticker'], 'clicks': trigger['value']}
+
+
+@app.callback(Output('ticker-input', 'value'), Input('open-ticker', 'data'), prevent_initial_call=True)
+def show_opened_ticker(opened):
+    return opened['ticker'] if opened else no_update
 
 
 if __name__ == '__main__':

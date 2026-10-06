@@ -6,8 +6,8 @@ import numpy as np
 import torch
 
 from model import ViT
+from rules import CLASSES  # noqa: F401  (re-exported for callers)
 
-CLASSES = ['doji', 'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star']
 CHECKPOINT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'checkpoints', '25_model.pt')
 CROP = dict(x_min=130, y_min=43, x_max=202, y_max=147)  # last eight candles, in 224x224 space
 

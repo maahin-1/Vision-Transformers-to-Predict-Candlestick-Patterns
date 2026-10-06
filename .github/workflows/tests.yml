@@ -13,6 +13,6 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
-      # The tests only need numpy and Pillow, so skip the multi-GB torch install.
+      # The tests do not need torch, so skip its multi-GB install.
       - name: Run tests
-        run: uv run --no-project --with pytest --with numpy --with pillow pytest -q tests
+        run: uv run --no-project --with pytest --with numpy --with pillow --with pandas --with yfinance pytest -q tests

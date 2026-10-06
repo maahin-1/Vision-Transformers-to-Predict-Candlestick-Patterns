@@ -5,6 +5,8 @@ These are common textbook thresholds, not the labelling used for training, so a 
 a prompt to look at the chart, not proof the model is wrong.
 """
 
+CLASSES = ['doji', 'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star']  # model output order
+
 DOJI_BODY_RATIO = 0.1  # body <= 10% of the candle's high-low range
 SMALL_BODY_RATIO = 0.5  # star middle body <= 50% of the first candle's body
 
@@ -65,3 +67,9 @@ def detect(candles):
         if is_evening_star(*candles[-3:]):
             found.append('evening_star')
     return found
+
+
+def detect_frame(df):
+    """detect() on the last three rows of a DataFrame with Open/High/Low/Close columns."""
+    candles = [tuple(r) for r in df[['Open', 'High', 'Low', 'Close']].tail(3).itertuples(index=False)]
+    return detect(candles)
