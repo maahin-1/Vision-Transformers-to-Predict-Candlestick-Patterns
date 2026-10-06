@@ -20,15 +20,15 @@ def download_model():
 
     # Skip if already exists
     if checkpoint_path.exists():
-        print(f"✓ Model already exists at {CHECKPOINT_PATH}")
+        print(f"Model already exists at {CHECKPOINT_PATH}")
         return
 
     print(f"Downloading model from {CHECKPOINT_URL}...")
     try:
         urllib.request.urlretrieve(CHECKPOINT_URL, str(checkpoint_path))
-        print(f"✓ Model downloaded to {CHECKPOINT_PATH}")
+        print(f"Model downloaded to {CHECKPOINT_PATH}")
     except Exception as e:
-        print(f"✗ Failed to download model: {e}")
+        print(f"Failed to download model: {e}")
         sys.exit(1)
 
 
