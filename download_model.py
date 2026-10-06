@@ -7,7 +7,7 @@ import urllib.request
 from pathlib import Path
 
 
-CHECKPOINT_URL = "https://github.com/maahinosahan/Vision-Transformers-to-Predict-Candlestick-Patterns/releases/download/v1.0.0/25_model.pt"
+CHECKPOINT_URL = "https://github.com/maahin-1/Vision-Transformers-to-Predict-Candlestick-Patterns/releases/download/v1.0.0/25_model.pt"
 CHECKPOINT_PATH = "checkpoints/25_model.pt"
 
 

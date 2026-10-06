@@ -30,3 +30,6 @@ test_live_preds_cached/
 *.ipynb
 .vscode/
 .idea/
+
+# Playwright MCP scratch
+.playwright-mcp/
