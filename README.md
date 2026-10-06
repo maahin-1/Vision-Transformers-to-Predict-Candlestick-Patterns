@@ -4,6 +4,10 @@ A Vision Transformer (ViT) that recognises candlestick patterns on a live stock 
 
 **Patterns detected:** doji, bullish engulfing, bearish engulfing, morning star, evening star.
 
+![The app tracking AMZN: candlestick chart, ViT prediction, rule check, model input and OHLCV table](images/app.png)
+
+*Here the model says `bearish_engulfing` at 93.9% while the rule check finds no pattern. That kind of disagreement is exactly what the rule check is for; see **Caveats**.*
+
 ## Setup
 
 Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
