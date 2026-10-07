@@ -4,6 +4,8 @@ The ViT was trained on 700x500 downscaled screenshots of a Plotly chart showing 
 Rendering the same picture straight from OHLC data means the model never depends on where a
 browser window sits on screen. Geometry below was measured from the training images.
 """
+from datetime import datetime, timedelta
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -19,6 +21,12 @@ DOWN = (255, 65, 54)
 TEXT = (42, 63, 95)
 Y_PAD = 0.056
 LINE_PX = 1.3
+
+
+def training_style_times(n=N_CANDLES):
+    """Fake 1-minute timestamps. The model only saw 1-minute charts, so every timeframe is drawn with the
+    same time axis (gridline every fifth candle); the picture is autoscaled, so only candle shapes matter."""
+    return [datetime(2025, 7, 17, 10, 48) + timedelta(minutes=i) for i in range(n)]
 
 
 def _blend(color, alpha=0.5, base=BG):

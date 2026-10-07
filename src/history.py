@@ -4,7 +4,7 @@ import os
 from collections import deque
 from datetime import datetime, timezone
 
-FIELDS = ['logged_at', 'ticker', 'mode', 'candle_time', 'close', 'prediction', 'confidence', 'rule_patterns', 'agrees']
+FIELDS = ['logged_at', 'ticker', 'mode', 'timeframe', 'candle_time', 'close', 'prediction', 'confidence', 'rule_patterns', 'agrees']
 DEFAULT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs', 'detections.csv')
 
 
@@ -21,20 +21,25 @@ class HistoryLog:
         if not os.path.exists(self.path):
             return
         with open(self.path, newline='', encoding='utf-8') as f:
+            header = next(csv.reader(f), [])
+        if header != FIELDS:  # written by an older version: keep it aside rather than mix column layouts
+            os.replace(self.path, self.path.replace('.csv', f'.legacy-{datetime.now():%Y%m%d%H%M%S}.csv'))
+            return
+        with open(self.path, newline='', encoding='utf-8') as f:
             for row in csv.DictReader(f):
                 self._recent.append(row)
 
-    def log(self, ticker, mode, candle_time, close, prediction, confidence, rule_patterns):
+    def log(self, ticker, mode, candle_time, close, prediction, confidence, rule_patterns, timeframe='1m'):
         """Write one row unless this ticker/mode/candle was already logged. Returns True if written."""
         if not self._loaded:
             self._load()
-        key = (ticker, mode, str(candle_time))
+        key = (ticker, mode, timeframe, str(candle_time))
         if key in self._seen:
             return False
         self._seen.add(key)
         row = {
             'logged_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-            'ticker': ticker, 'mode': mode, 'candle_time': str(candle_time), 'close': f'{close:.4f}',
+            'ticker': ticker, 'mode': mode, 'timeframe': timeframe, 'candle_time': str(candle_time), 'close': f'{close:.4f}',
             'prediction': prediction, 'confidence': f'{confidence:.4f}',
             'rule_patterns': '|'.join(rule_patterns), 'agrees': str(prediction in rule_patterns),
         }

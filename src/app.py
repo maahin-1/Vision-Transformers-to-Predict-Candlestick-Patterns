@@ -11,21 +11,25 @@ import base64
 import io
 import threading
 import time
+import uuid
 
 import plotly.graph_objects as go
 from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 from PIL import Image
 
+import context
 import history
 import market
 import predictor
 import render
 import rules
 import scanner
+import sessions
 
 CLASSES = rules.CLASSES
 COLORS = ['#ebdc9c', '#8ccfa6', '#c1abec', '#e8a3ca', '#ff8080']
 LIVE_POLL_MS = 30_000
+SLOW_POLL_MS = 60_000  # 5m and longer candles change less often
 REPLAY_MS = 1_000
 MODEL_WINDOW = 8  # candles the ViT crop covers
 START_TICKER = 'AMZN'
@@ -33,7 +37,12 @@ START_TICKER = 'AMZN'
 HISTORY = history.HistoryLog()
 _lock = threading.Lock()  # guards S and HISTORY
 _infer_lock = threading.Lock()  # one forward pass at a time
-S = {'ticker': None, 'mode': 'live', 'df': None, 'cursor': 0, 'fetched': 0.0, 'warning': '', 'error': '', 'cache': (None, None)}
+def _new_state():
+    return {'ticker': None, 'mode': 'live', 'timeframe': market.DEFAULT_TIMEFRAME, 'df': None, 'cursor': 0,
+            'fetched': 0.0, 'warning': '', 'error': '', 'cache': (None, None), 'used': time.monotonic()}
+
+
+S = sessions.SessionState(_new_state)  # one state per browser tab
 
 app = Dash(__name__, title='Candlestick Pattern Tracker')
 
@@ -41,62 +50,73 @@ PAGE = {'fontFamily': 'system-ui, Segoe UI, sans-serif', 'maxWidth': '1280px', '
         'color': '#1f2937'}
 CARD = {'background': '#fff', 'border': '1px solid #e5e7eb', 'borderRadius': '10px', 'padding': '14px'}
 
-app.layout = html.Div(style=PAGE, children=[
-    html.H2('Candlestick Pattern Tracker', style={'margin': '0 0 12px'}),
-    html.Div(style={'display': 'flex', 'gap': '10px', 'alignItems': 'center', 'flexWrap': 'wrap'}, children=[
-        dcc.Input(id='ticker-input', type='text', value=START_TICKER, placeholder='Ticker, e.g. AAPL',
-                  debounce=False, n_submit=0, style={'padding': '8px 10px', 'width': '180px', 'fontSize': '16px'}),
-        html.Button('Track', id='track-btn', n_clicks=0,
-                    style={'padding': '8px 18px', 'fontSize': '16px', 'cursor': 'pointer'}),
-        dcc.RadioItems(id='mode', value='live', inline=True, inputStyle={'marginRight': '4px', 'marginLeft': '12px'},
-                       options=[{'label': 'Live (polls Yahoo every 30 s)', 'value': 'live'},
-                                {'label': 'Replay last session (1 candle/s)', 'value': 'replay'}]),
-    ]),
-    html.Div(id='status', style={'margin': '10px 0', 'fontSize': '14px'}),
-    html.Div(style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}, children=[
-        html.Div(style={**CARD, 'flex': '3 1 640px', 'minWidth': '0'},
-                 children=dcc.Graph(id='chart', config={'displayModeBar': False}, style={'height': '440px'})),
-        html.Div(style={**CARD, 'flex': '1 1 320px'}, children=[
-            html.Div('ViT prediction', style={'fontWeight': 600, 'marginBottom': '8px'}),
-            html.Div(id='prediction'),
-            html.Div(id='rule-check', style={'marginTop': '12px', 'fontSize': '14px'}),
-            html.Div('What the model sees', style={'fontWeight': 600, 'margin': '14px 0 6px'}),
-            html.Img(id='model-view', style={'imageRendering': 'pixelated', 'border': '1px solid #e5e7eb'}),
-        ]),
-    ]),
-    html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
-        html.Div('Watchlist scanner', style={'fontWeight': 600, 'marginBottom': '8px'}),
+def _build_layout():
+    return html.Div(style=PAGE, children=[
+        html.H2('Candlestick Pattern Tracker', style={'margin': '0 0 12px'}),
         html.Div(style={'display': 'flex', 'gap': '10px', 'alignItems': 'center', 'flexWrap': 'wrap'}, children=[
-            dcc.Input(id='scan-input', type='text', value='AAPL, MSFT, TSLA, NVDA, AMZN',
-                      placeholder=f'Up to {scanner.MAX_TICKERS} tickers, comma separated',
-                      style={'padding': '6px 10px', 'width': '380px', 'fontSize': '15px'}),
-            html.Button('Scan', id='scan-btn', n_clicks=0, style={'padding': '6px 16px', 'cursor': 'pointer'}),
-            dcc.Checklist(id='scan-auto', value=[], options=[{'label': ' Auto-refresh every 30 s', 'value': 'auto'}]),
-            html.Span(id='scan-status', style={'fontSize': '13px', 'color': '#6b7280'}),
+            dcc.Input(id='ticker-input', type='text', value=START_TICKER, placeholder='Ticker, e.g. AAPL',
+                      debounce=False, n_submit=0, style={'padding': '8px 10px', 'width': '180px', 'fontSize': '16px'}),
+            dcc.Dropdown(id='timeframe', value=market.DEFAULT_TIMEFRAME, clearable=False, searchable=False,
+                         options=[{'label': tf, 'value': tf} for tf in market.TIMEFRAMES],
+                         style={'width': '80px', 'fontSize': '16px'}),
+            html.Button('Track', id='track-btn', n_clicks=0,
+                        style={'padding': '8px 18px', 'fontSize': '16px', 'cursor': 'pointer'}),
+            dcc.RadioItems(id='mode', value='live', inline=True, inputStyle={'marginRight': '4px', 'marginLeft': '12px'},
+                           options=[{'label': 'Live (polls Yahoo)', 'value': 'live'},
+                                    {'label': 'Replay (1 candle/s)', 'value': 'replay'}]),
         ]),
-        html.Div(id='scan-results', style={'marginTop': '10px'}),
-    ]),
-    html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
-        html.Div(f'Last {MODEL_WINDOW} candles (the ones the model reads) - compare with Yahoo or your broker',
-                 style={'fontWeight': 600, 'marginBottom': '8px'}),
-        html.Div(id='table'),
-    ]),
-    html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
-        html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center',
-                        'marginBottom': '8px'}, children=[
-            html.Div('Detection history (logged to logs/detections.csv)', style={'fontWeight': 600}),
-            html.Button('Download CSV', id='export-btn', n_clicks=0, style={'padding': '4px 12px', 'cursor': 'pointer'}),
-            dcc.Download(id='export-download'),
+        html.Div(id='status', style={'margin': '10px 0', 'fontSize': '14px'}),
+        html.Div(style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}, children=[
+            html.Div(style={**CARD, 'flex': '3 1 640px', 'minWidth': '0'},
+                     children=dcc.Graph(id='chart', config={'displayModeBar': False}, style={'height': '440px'})),
+            html.Div(style={**CARD, 'flex': '1 1 320px'}, children=[
+                html.Div('ViT prediction', style={'fontWeight': 600, 'marginBottom': '8px'}),
+                html.Div(id='prediction'),
+                html.Div(id='rule-check', style={'marginTop': '12px', 'fontSize': '14px'}),
+                html.Div(id='context', style={'marginTop': '6px', 'fontSize': '14px'}),
+                html.Div('What the model sees', style={'fontWeight': 600, 'margin': '14px 0 6px'}),
+                html.Img(id='model-view', style={'imageRendering': 'pixelated', 'border': '1px solid #e5e7eb'}),
+            ]),
         ]),
-        html.Div(id='history'),
-    ]),
-    html.Div('Educational demo, not financial advice. The model has no "no pattern" class: it always picks one of '
-             'five, so read the confidence and the rule check.',
-             style={'marginTop': '12px', 'fontSize': '12px', 'color': '#6b7280'}),
-    dcc.Interval(id='tick', interval=REPLAY_MS, n_intervals=0),
-    dcc.Interval(id='scan-tick', interval=LIVE_POLL_MS, n_intervals=0, disabled=True),
-    dcc.Store(id='open-ticker'),
-])
+        html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
+            html.Div('Watchlist scanner', style={'fontWeight': 600, 'marginBottom': '8px'}),
+            html.Div(style={'display': 'flex', 'gap': '10px', 'alignItems': 'center', 'flexWrap': 'wrap'}, children=[
+                dcc.Input(id='scan-input', type='text', value='AAPL, MSFT, TSLA, NVDA, AMZN',
+                          placeholder=f'Up to {scanner.MAX_TICKERS} tickers, comma separated',
+                          style={'padding': '6px 10px', 'width': '380px', 'fontSize': '15px'}),
+                html.Button('Scan', id='scan-btn', n_clicks=0, style={'padding': '6px 16px', 'cursor': 'pointer'}),
+                dcc.Checklist(id='scan-auto', value=[], options=[{'label': ' Auto-refresh', 'value': 'auto'}]),
+                dcc.Checklist(id='scan-fit', value=[], options=[{'label': ' Only signals that fit the trend',
+                                                                 'value': 'fit'}]),
+                html.Span(id='scan-status', style={'fontSize': '13px', 'color': '#6b7280'}),
+            ]),
+            html.Div(id='scan-results', style={'marginTop': '10px'}),
+        ]),
+        html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
+            html.Div(f'Last {MODEL_WINDOW} candles (the ones the model reads) - compare with Yahoo or your broker',
+                     style={'fontWeight': 600, 'marginBottom': '8px'}),
+            html.Div(id='table'),
+        ]),
+        html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center',
+                            'marginBottom': '8px'}, children=[
+                html.Div('Detection history (logged to logs/detections.csv)', style={'fontWeight': 600}),
+                html.Button('Download CSV', id='export-btn', n_clicks=0, style={'padding': '4px 12px', 'cursor': 'pointer'}),
+                dcc.Download(id='export-download'),
+            ]),
+            html.Div(id='history'),
+        ]),
+        html.Div('Educational demo, not financial advice. The model has no "no pattern" class: it always picks one of '
+                 'five, so read the confidence and the rule check.',
+                 style={'marginTop': '12px', 'fontSize': '12px', 'color': '#6b7280'}),
+        dcc.Interval(id='tick', interval=REPLAY_MS, n_intervals=0),
+        dcc.Interval(id='scan-tick', interval=LIVE_POLL_MS, n_intervals=0, disabled=True),
+        dcc.Store(id='open-ticker'),
+        dcc.Store(id='sid', data=uuid.uuid4().hex),
+    ])
+
+
+app.layout = _build_layout  # called per page load
 
 
 def _infer(image):
@@ -104,30 +124,38 @@ def _infer(image):
         return predictor.predict(image)
 
 
-def _start(ticker_text, mode):
+def _poll_ms(timeframe):
+    return LIVE_POLL_MS if timeframe in ('1m',) else SLOW_POLL_MS
+
+
+def _start(ticker_text, mode, timeframe):
     """(Re)load the ticker. Raises MarketDataError with a user-readable message."""
     ticker = market.normalize_ticker(ticker_text)
-    df = market.fetch_candles(ticker)
-    S.update(ticker=ticker, mode=mode, df=df, cursor=market.MIN_CANDLES, fetched=time.monotonic(), warning='',
+    df = market.fetch_candles(ticker, timeframe)
+    S.update(ticker=ticker, mode=mode, timeframe=timeframe, df=df, cursor=market.MIN_CANDLES, fetched=time.monotonic(), warning='',
              cache=(None, None))
 
 
 def _visible():
     df = S['df']
-    return df.iloc[:S['cursor']] if S['mode'] == 'replay' else market.closed_only(df)
+    if S['mode'] == 'replay':
+        return df.iloc[:S['cursor']]
+    return market.closed_only(df, market.timeframe_seconds(S['timeframe']))
 
 
 def _status(visible):
     last = visible['Datetime'].iloc[-1]
-    state, age = market.market_status(S['df'])
+    tf = S['timeframe']
+    state, age = market.market_status(S['df'], market.timeframe_seconds(tf))
+    stamp = f"{last:%Y-%m-%d} " + market.format_time(last, tf) if tf != '1d' else market.format_time(last, tf)
     if S['mode'] == 'replay':
-        text = f"REPLAY {S['ticker']} - candle {len(visible)}/{len(S['df'])} - {last:%Y-%m-%d %H:%M %Z}"
+        text = f"REPLAY {S['ticker']} {tf} - candle {len(visible)}/{len(S['df'])} - {stamp}"
         color = '#2563eb'
     elif state == 'live':
-        text = f"LIVE {S['ticker']} - last closed candle {last:%H:%M %Z} ({age:.0f} min ago; Yahoo may be delayed)"
+        text = f"LIVE {S['ticker']} {tf} - last closed candle {stamp} ({age:.0f} min ago; Yahoo may be delayed)"
         color = '#059669'
     else:
-        text = (f"MARKET CLOSED {S['ticker']} - showing last session ending {last:%Y-%m-%d %H:%M %Z}. "
+        text = (f"MARKET CLOSED {S['ticker']} {tf} - latest candle {stamp}. "
                 f'Switch to Replay to watch it play out.')
         color = '#b45309'
     children = [html.Span(text, style={'color': color, 'fontWeight': 600})]
@@ -138,23 +166,24 @@ def _status(visible):
 
 def _figure(visible):
     data = visible.iloc[-render.N_CANDLES:]
-    fig = go.Figure(go.Candlestick(x=data['Datetime'], open=data['Open'], high=data['High'], low=data['Low'],
+    labels = [market.format_time(t, S['timeframe']) for t in data['Datetime']]
+    fig = go.Figure(go.Candlestick(x=labels, open=data['Open'], high=data['High'], low=data['Low'],
                                    close=data['Close'], increasing_line_color='#3D9970', decreasing_line_color='#FF4136'))
-    half = (data['Datetime'].iloc[1] - data['Datetime'].iloc[0]) / 2
-    fig.add_vrect(x0=data['Datetime'].iloc[-MODEL_WINDOW] - half, x1=data['Datetime'].iloc[-1] + half,
-                  fillcolor='#6366f1', opacity=0.10, line_width=0,
+    n = len(labels)  # category axes put candle i at position i
+    fig.add_vrect(x0=n - MODEL_WINDOW - 0.5, x1=n - 0.5, fillcolor='#6366f1', opacity=0.10, line_width=0,
                   annotation_text='model window', annotation_position='top left', annotation_font_size=11)
-    fig.update_layout(margin=dict(l=50, r=20, t=20, b=40), xaxis_rangeslider_visible=False, uirevision=S['ticker'],
-                      height=420, template='plotly_white', showlegend=False)
+    fig.update_layout(margin=dict(l=50, r=20, t=20, b=40), xaxis_rangeslider_visible=False,
+                      uirevision=f"{S['ticker']}-{S['timeframe']}", height=420, template='plotly_white',
+                      showlegend=False, xaxis_type='category', xaxis_nticks=8)
     return fig
 
 
 def _predict(visible):
-    key = (S['ticker'], visible['Datetime'].iloc[-1])
+    key = (S['ticker'], S['timeframe'], visible['Datetime'].iloc[-1])
     if S['cache'][0] == key:
         return S['cache'][1]
     data = visible.iloc[-render.N_CANDLES:]
-    image = render.render_chart(data['Open'], data['High'], data['Low'], data['Close'], list(data['Datetime']))
+    image = render.render_chart(data['Open'], data['High'], data['Low'], data['Close'], render.training_style_times())
     probs = _infer(image)
     view = Image.fromarray(predictor.model_view(image)).resize((216, 312), Image.Resampling.NEAREST)
     buf = io.BytesIO()
@@ -189,11 +218,21 @@ def _rule_panel(found, top_class):
                       style={'color': '#059669' if agree else '#b45309', 'fontWeight': 600})]
 
 
+def _context_panel(visible, top_class):
+    info = context.describe(visible, top_class)
+    fit_color = {'fits': '#059669', 'against': '#b45309', 'neutral': '#6b7280'}[info['fit']]
+    trend = 'n/a' if info['trend'] == 'n/a' else f"{info['trend']} ({info['trend_score']:+.1f} avg ranges)"
+    volume = 'n/a' if info['volume'] == 'n/a' else f"{info['volume']} ({info['volume_ratio']:.1f}x avg)"
+    return [html.Span(f'Trend before: {trend}  |  Volume: {volume}  |  ', style={'color': '#374151'}),
+            html.Span({'fits': 'pattern fits the trend', 'against': 'pattern goes against the trend',
+                       'neutral': 'no clear trend context'}[info['fit']], style={'color': fit_color, 'fontWeight': 600})]
+
+
 def _table(visible):
     tail = visible.tail(MODEL_WINDOW)
     head = html.Tr([html.Th(c, style={'textAlign': 'right', 'padding': '4px 10px'}) for c in
                     ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']])
-    body = [html.Tr([html.Td(f'{r.Datetime:%H:%M}', style={'padding': '4px 10px', 'textAlign': 'right'})] +
+    body = [html.Tr([html.Td(market.format_time(r.Datetime, S['timeframe']), style={'padding': '4px 10px', 'textAlign': 'right'})] +
                     [html.Td(f'{v:,.2f}', style={'padding': '4px 10px', 'textAlign': 'right'}) for v in
                      (r.Open, r.High, r.Low, r.Close)] +
                     [html.Td(f'{int(r.Volume):,}', style={'padding': '4px 10px', 'textAlign': 'right'})])
@@ -205,44 +244,47 @@ def _history_table():
     rows = HISTORY.recent(10)
     if not rows:
         return html.Div('Nothing logged yet.', style={'color': '#6b7280', 'fontSize': '14px'})
-    cols = [('candle_time', 'Candle'), ('ticker', 'Ticker'), ('mode', 'Mode'), ('close', 'Close'),
+    cols = [('candle_time', 'Candle'), ('ticker', 'Ticker'), ('mode', 'Mode'), ('timeframe', 'TF'), ('close', 'Close'),
             ('prediction', 'Model'), ('confidence', 'Conf.'), ('rule_patterns', 'Rules'), ('agrees', 'Agree')]
     head = html.Tr([html.Th(label, style={'textAlign': 'left', 'padding': '4px 10px'}) for _, label in cols])
-    body = [html.Tr([html.Td(r[key] or '-', style={'padding': '4px 10px'}) for key, _ in cols]) for r in rows]
+    body = [html.Tr([html.Td(r.get(key) or '-', style={'padding': '4px 10px'}) for key, _ in cols]) for r in rows]
     return html.Table([html.Thead(head), html.Tbody(body)], style={'borderCollapse': 'collapse', 'fontSize': '13px'})
 
 
 def _message(text, interval):
     empty = go.Figure().update_layout(template='plotly_white', xaxis_visible=False, yaxis_visible=False)
-    return empty, html.Span(text, style={'color': '#b91c1c', 'fontWeight': 600}), '', '', '', '', interval, no_update
+    return empty, html.Span(text, style={'color': '#b91c1c', 'fontWeight': 600}), '', '', '', '', '', interval, no_update
 
 
 @app.callback(
     Output('chart', 'figure'), Output('status', 'children'), Output('prediction', 'children'),
-    Output('rule-check', 'children'), Output('model-view', 'src'), Output('table', 'children'),
-    Output('tick', 'interval'), Output('history', 'children'),
+    Output('rule-check', 'children'), Output('context', 'children'), Output('model-view', 'src'),
+    Output('table', 'children'), Output('tick', 'interval'), Output('history', 'children'),
     Input('tick', 'n_intervals'), Input('track-btn', 'n_clicks'), Input('ticker-input', 'n_submit'),
-    Input('mode', 'value'), Input('open-ticker', 'data'), State('ticker-input', 'value'),
+    Input('mode', 'value'), Input('timeframe', 'value'), Input('open-ticker', 'data'),
+    State('ticker-input', 'value'), State('sid', 'data'),
 )
-def refresh(_n, _clicks, _submit, mode, opened, ticker_text):
+def refresh(_n, _clicks, _submit, mode, timeframe, opened, ticker_text, sid):
     with _lock:
-        interval = LIVE_POLL_MS if mode == 'live' else REPLAY_MS
+        S.use(sid)
+        interval = _poll_ms(timeframe) if mode == 'live' else REPLAY_MS
         trigger = ctx.triggered_id
         if trigger == 'open-ticker':
             ticker_text = opened['ticker']
         try:
-            # A page load (no trigger) or a mode mismatch re-syncs the server with what the page shows
-            if (trigger in (None, 'track-btn', 'ticker-input', 'mode', 'open-ticker') or S['mode'] != mode
+            # A page load (no trigger) or a mode/timeframe mismatch re-syncs the server with what the page shows
+            if (trigger in (None, 'track-btn', 'ticker-input', 'mode', 'timeframe', 'open-ticker')
+                    or S['mode'] != mode or S['timeframe'] != timeframe
                     or (S['df'] is None and not S['error'])):
                 S['error'] = ''
-                _start(ticker_text, mode)
+                _start(ticker_text, mode, timeframe)
             elif S['df'] is None:  # last attempt failed; wait for the user instead of hammering Yahoo
                 return _message(S['error'], interval)
             elif mode == 'replay':
                 S['cursor'] = min(S['cursor'] + 1, len(S['df']))
-            elif time.monotonic() - S['fetched'] > LIVE_POLL_MS / 1000 - 1:
+            elif time.monotonic() - S['fetched'] > interval / 1000 - 1:
                 try:
-                    S.update(df=market.fetch_candles(S['ticker']), fetched=time.monotonic(), warning='')
+                    S.update(df=market.fetch_candles(S['ticker'], S['timeframe']), fetched=time.monotonic(), warning='')
                 except market.MarketDataError as exc:  # keep showing the last good data
                     S['warning'] = f'refresh failed: {exc}'
             visible = _visible()
@@ -258,9 +300,9 @@ def refresh(_n, _clicks, _submit, mode, opened, ticker_text):
         panel, top_class = _prediction_panel(probs)
         found = rules.detect_frame(visible)
         HISTORY.log(S['ticker'], S['mode'], visible['Datetime'].iloc[-1], visible['Close'].iloc[-1], top_class,
-                    max(probs), found)
-        return (_figure(visible), _status(visible), panel, _rule_panel(found, top_class), src, _table(visible),
-                interval, _history_table())
+                    max(probs), found, timeframe=S['timeframe'])
+        return (_figure(visible), _status(visible), panel, _rule_panel(found, top_class),
+                _context_panel(visible, top_class), src, _table(visible), interval, _history_table())
 
 
 @app.callback(Output('export-download', 'data'), Input('export-btn', 'n_clicks'), prevent_initial_call=True)
@@ -269,7 +311,7 @@ def export_history(_clicks):
 
 
 def _scan_table(rows):
-    cols = ['Ticker', 'Model', 'Conf.', 'Rules', 'Agree', 'Market', 'Last candle', 'Close', '']
+    cols = ['Ticker', 'Model', 'Conf.', 'Rules', 'Agree', 'Trend', 'Volume', 'Context', 'Market', 'Last candle', 'Close', '']
     head = html.Tr([html.Th(c, style={'textAlign': 'left', 'padding': '4px 10px'}) for c in cols])
     body = []
     for r in rows:
@@ -278,7 +320,7 @@ def _scan_table(rows):
         cell = {'padding': '4px 10px'}
         if r['error']:
             body.append(html.Tr([html.Td(r['ticker'], style={**cell, 'fontWeight': 600}),
-                                 html.Td(r['error'], colSpan=7, style={**cell, 'color': '#b91c1c'}),
+                                 html.Td(r['error'], colSpan=10, style={**cell, 'color': '#b91c1c'}),
                                  html.Td(button, style=cell)]))
             continue
         tint = '#ecfdf5' if r['agrees'] else 'transparent'
@@ -288,8 +330,11 @@ def _scan_table(rows):
             html.Td(f"{r['confidence']:.1%}", style=cell),
             html.Td(', '.join(r['rules']) or '-', style=cell),
             html.Td('yes' if r['agrees'] else 'no', style=cell),
+            html.Td(r['trend'], style=cell),
+            html.Td(r['volume'] if r['volume'] == 'n/a' else f"{r['volume']} ({r['volume_ratio']:.1f}x)", style=cell),
+            html.Td(r['fit'], style={**cell, 'color': {'fits': '#059669', 'against': '#b45309'}.get(r['fit'], '#6b7280')}),
             html.Td(r['market'], style=cell),
-            html.Td(f"{r['candle_time']:%m-%d %H:%M}", style=cell),
+            html.Td(market.format_time(r['candle_time'], r['timeframe']), style=cell),
             html.Td(f"{r['close']:,.2f}", style=cell),
             html.Td(button, style=cell),
         ]))
@@ -298,8 +343,8 @@ def _scan_table(rows):
 
 @app.callback(Output('scan-results', 'children'), Output('scan-status', 'children'),
               Input('scan-btn', 'n_clicks'), Input('scan-tick', 'n_intervals'), State('scan-input', 'value'),
-              prevent_initial_call=True)
-def run_scan(_clicks, _n, text):
+              State('timeframe', 'value'), State('scan-fit', 'value'), prevent_initial_call=True)
+def run_scan(_clicks, _n, text, timeframe, fit_only):
     tickers, rejected, truncated = scanner.parse_tickers(text)
     notes = []
     if rejected:
@@ -309,14 +354,19 @@ def run_scan(_clicks, _n, text):
     if not tickers:
         return no_update, 'Enter at least one valid ticker.'
     started = time.monotonic()
-    rows = scanner.scan(tickers, _infer)
+    rows = scanner.scan(tickers, _infer, timeframe=timeframe)
     with _lock:
         for r in rows:
             if not r['error']:
                 HISTORY.log(r['ticker'], 'scan', r['candle_time'], r['close'], r['prediction'], r['confidence'],
-                            r['rules'])
+                            r['rules'], timeframe=timeframe)
     ok = sum(1 for r in rows if not r['error'])
-    status = f'{ok}/{len(rows)} scanned in {time.monotonic() - started:.1f} s at {time.strftime("%H:%M:%S")}'
+    status = (f'{ok}/{len(rows)} scanned ({timeframe}) in {time.monotonic() - started:.1f} s '
+              f'at {time.strftime("%H:%M:%S")}')
+    if fit_only:
+        shown = [r for r in rows if r['error'] or r['fit'] == 'fits']
+        notes.append(f"{len(shown) - sum(1 for r in shown if r['error'])} fit the trend")
+        rows = shown
     return _scan_table(rows), '  |  '.join([status] + notes)
 
 

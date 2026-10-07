@@ -27,3 +27,21 @@ def test_recent_is_newest_first_and_survives_restart(tmp_path):
     assert [r['candle_time'] for r in first.recent(2)] == ['c2', 'c1']
     second = HistoryLog(path)  # new process, same file
     assert [r['candle_time'] for r in second.recent(3)] == ['c2', 'c1', 'c0']
+
+
+def test_timeframe_is_part_of_the_dedup_key(tmp_path):
+    log = HistoryLog(str(tmp_path / 'd.csv'))
+    assert log.log('AAPL', 'live', 'c1', 1.0, 'doji', 0.5, [], timeframe='1m')
+    assert log.log('AAPL', 'live', 'c1', 1.0, 'doji', 0.5, [], timeframe='1d')
+    assert not log.log('AAPL', 'live', 'c1', 1.0, 'doji', 0.5, [], timeframe='1d')
+
+
+def test_old_layout_file_is_set_aside(tmp_path):
+    path = tmp_path / 'd.csv'
+    path.write_text('logged_at,ticker\n2026-01-01,AAPL\n', encoding='utf-8')
+    log = HistoryLog(str(path))
+    assert log.recent() == []
+    assert log.log('AAPL', 'live', 'c1', 1.0, 'doji', 0.5, [])
+    assert any('legacy' in name for name in os.listdir(tmp_path))
+    with open(path, newline='') as f:
+        assert next(csv.reader(f)) == FIELDS

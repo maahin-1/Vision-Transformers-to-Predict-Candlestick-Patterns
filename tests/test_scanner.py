@@ -43,7 +43,7 @@ def test_analyze_builds_a_row():
 
 
 def test_scan_sorts_by_confidence_and_isolates_failures():
-    def fetch(ticker):
+    def fetch(ticker, timeframe):
         if ticker == 'BAD':
             raise market.MarketDataError('No 1-minute data for "BAD".')
         return fake_df()
@@ -61,5 +61,23 @@ def test_scan_sorts_by_confidence_and_isolates_failures():
 
 
 def test_scan_reports_too_few_candles():
-    rows = scanner.scan(['TINY'], fake_predict, fetch=lambda t: fake_df(10))
+    rows = scanner.scan(['TINY'], fake_predict, fetch=lambda t, tf: fake_df(10))
     assert 'closed candles' in rows[0]['error']
+
+
+def test_analyze_reports_timeframe_and_context():
+    row = scanner.analyze('AAPL', fake_df(), fake_predict, '5m')
+    assert row['timeframe'] == '5m'
+    assert row['trend'] in ('up', 'down', 'sideways', 'n/a')
+    assert row['fit'] in ('fits', 'against', 'neutral')
+
+
+def test_scan_passes_the_timeframe_to_fetch():
+    seen = []
+
+    def fetch(ticker, timeframe):
+        seen.append(timeframe)
+        return fake_df()
+
+    scanner.scan(['AAA'], fake_predict, fetch=fetch, timeframe='1h')
+    assert seen == ['1h']
