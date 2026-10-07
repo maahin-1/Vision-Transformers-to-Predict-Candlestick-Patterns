@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 from PIL import Image
 
+import alerts
 import context
 import history
 import market
@@ -35,6 +36,8 @@ MODEL_WINDOW = 8  # candles the ViT crop covers
 START_TICKER = 'AMZN'
 
 HISTORY = history.HistoryLog()
+FEED = alerts.AlertFeed()
+_telegram = {'error': ''}  # last Telegram failure, shown in the alerts card
 _lock = threading.Lock()  # guards S and HISTORY
 _infer_lock = threading.Lock()  # one forward pass at a time
 def _new_state():
@@ -93,6 +96,25 @@ def _build_layout():
             html.Div(id='scan-results', style={'marginTop': '10px'}),
         ]),
         html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
+            html.Div('Alerts', style={'fontWeight': 600, 'marginBottom': '4px'}),
+            html.Div('Fires for live signals only (never Replay or a closed market), once per candle, while this page '
+                     'is open. Applies to the main view in Live mode and to scanner runs.',
+                     style={'fontSize': '12px', 'color': '#6b7280', 'marginBottom': '8px'}),
+            html.Div(style={'display': 'flex', 'gap': '14px', 'alignItems': 'center', 'flexWrap': 'wrap'}, children=[
+                html.Span('Min confidence %'),
+                dcc.Input(id='alert-conf', type='number', min=50, max=99, step=1, value=85,
+                          style={'width': '70px', 'padding': '4px 6px'}),
+                dcc.Checklist(id='alert-opts', value=['agree'], inline=True,
+                              inputStyle={'marginRight': '4px', 'marginLeft': '10px'},
+                              options=[{'label': 'rules must agree', 'value': 'agree'},
+                                       {'label': 'must fit the trend', 'value': 'fit'},
+                                       {'label': 'browser notification', 'value': 'browser'},
+                                       {'label': 'Telegram', 'value': 'telegram'}]),
+            ]),
+            html.Div(id='telegram-status', style={'fontSize': '12px', 'color': '#6b7280', 'marginTop': '6px'}),
+            html.Div(id='alerts-feed', style={'marginTop': '8px'}),
+        ]),
+        html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
             html.Div(f'Last {MODEL_WINDOW} candles (the ones the model reads) - compare with Yahoo or your broker',
                      style={'fontWeight': 600, 'marginBottom': '8px'}),
             html.Div(id='table'),
@@ -113,6 +135,8 @@ def _build_layout():
         dcc.Interval(id='scan-tick', interval=LIVE_POLL_MS, n_intervals=0, disabled=True),
         dcc.Store(id='open-ticker'),
         dcc.Store(id='sid', data=uuid.uuid4().hex),
+        dcc.Store(id='alert-signal'), dcc.Store(id='alert-sink-1'), dcc.Store(id='alert-sink-2'),
+        dcc.Interval(id='alert-tick', interval=5_000, n_intervals=0),
     ])
 
 
@@ -122,6 +146,29 @@ app.layout = _build_layout  # called per page load
 def _infer(image):
     with _infer_lock:
         return predictor.predict(image)
+
+
+def _alert_settings(conf, opts):
+    opts = opts or []
+    pct = min(99, max(50, conf if isinstance(conf, (int, float)) else 85))
+    return alerts.Settings(min_confidence=pct / 100, require_agree='agree' in opts, require_fit='fit' in opts)
+
+
+def _notify(rows, conf, opts):
+    """Add matching rows to the alert feed and, if enabled, send each new one to Telegram."""
+    settings = _alert_settings(conf, opts)
+    creds = alerts.telegram_credentials() if 'telegram' in (opts or []) else None
+    for row in rows:
+        if not alerts.matches(row, settings):
+            continue
+        message = FEED.add(row)
+        if message and creds:
+            threading.Thread(target=_send_telegram, args=(message, creds), daemon=True).start()
+
+
+def _send_telegram(message, creds):
+    ok, error = alerts.send_telegram(message, *creds)
+    _telegram['error'] = '' if ok else error
 
 
 def _poll_ms(timeframe):
@@ -262,9 +309,9 @@ def _message(text, interval):
     Output('table', 'children'), Output('tick', 'interval'), Output('history', 'children'),
     Input('tick', 'n_intervals'), Input('track-btn', 'n_clicks'), Input('ticker-input', 'n_submit'),
     Input('mode', 'value'), Input('timeframe', 'value'), Input('open-ticker', 'data'),
-    State('ticker-input', 'value'), State('sid', 'data'),
+    State('ticker-input', 'value'), State('sid', 'data'), State('alert-conf', 'value'), State('alert-opts', 'value'),
 )
-def refresh(_n, _clicks, _submit, mode, timeframe, opened, ticker_text, sid):
+def refresh(_n, _clicks, _submit, mode, timeframe, opened, ticker_text, sid, alert_conf, alert_opts):
     with _lock:
         S.use(sid)
         interval = _poll_ms(timeframe) if mode == 'live' else REPLAY_MS
@@ -301,6 +348,8 @@ def refresh(_n, _clicks, _submit, mode, timeframe, opened, ticker_text, sid):
         found = rules.detect_frame(visible)
         HISTORY.log(S['ticker'], S['mode'], visible['Datetime'].iloc[-1], visible['Close'].iloc[-1], top_class,
                     max(probs), found, timeframe=S['timeframe'])
+        if S['mode'] == 'live':  # replayed candles are not real signals
+            _notify([scanner.build_row(S['ticker'], S['timeframe'], visible, probs, S['df'])], alert_conf, alert_opts)
         return (_figure(visible), _status(visible), panel, _rule_panel(found, top_class),
                 _context_panel(visible, top_class), src, _table(visible), interval, _history_table())
 
@@ -343,8 +392,9 @@ def _scan_table(rows):
 
 @app.callback(Output('scan-results', 'children'), Output('scan-status', 'children'),
               Input('scan-btn', 'n_clicks'), Input('scan-tick', 'n_intervals'), State('scan-input', 'value'),
-              State('timeframe', 'value'), State('scan-fit', 'value'), prevent_initial_call=True)
-def run_scan(_clicks, _n, text, timeframe, fit_only):
+              State('timeframe', 'value'), State('scan-fit', 'value'), State('alert-conf', 'value'),
+              State('alert-opts', 'value'), prevent_initial_call=True)
+def run_scan(_clicks, _n, text, timeframe, fit_only, alert_conf, alert_opts):
     tickers, rejected, truncated = scanner.parse_tickers(text)
     notes = []
     if rejected:
@@ -360,6 +410,7 @@ def run_scan(_clicks, _n, text, timeframe, fit_only):
             if not r['error']:
                 HISTORY.log(r['ticker'], 'scan', r['candle_time'], r['close'], r['prediction'], r['confidence'],
                             r['rules'], timeframe=timeframe)
+    _notify(rows, alert_conf, alert_opts)
     ok = sum(1 for r in rows if not r['error'])
     status = (f'{ok}/{len(rows)} scanned ({timeframe}) in {time.monotonic() - started:.1f} s '
               f'at {time.strftime("%H:%M:%S")}')
@@ -387,6 +438,43 @@ def open_ticker(_clicks):
 @app.callback(Output('ticker-input', 'value'), Input('open-ticker', 'data'), prevent_initial_call=True)
 def show_opened_ticker(opened):
     return opened['ticker'] if opened else no_update
+
+
+@app.callback(Output('alerts-feed', 'children'), Output('alert-signal', 'data'), Output('telegram-status', 'children'),
+              Input('alert-tick', 'n_intervals'))
+def render_alerts(_n):
+    items = FEED.recent(10)
+    feed = ([html.Div(f"{a['time']}  {a['message']}", style={'fontSize': '14px', 'padding': '2px 0'}) for a in items]
+            or html.Div('No alerts yet.', style={'fontSize': '14px', 'color': '#6b7280'}))
+    if alerts.telegram_credentials():
+        telegram = 'Telegram: configured.' + (f" Last send failed: {_telegram['error']}" if _telegram['error'] else '')
+    else:
+        telegram = 'Telegram: not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID before starting the app.'
+    return feed, {'total': FEED.total, 'latest': items[0]['message'] if items else ''}, telegram
+
+
+app.clientside_callback(
+    """function(signal, opts) {
+        if (!signal) { return window.dash_clientside.no_update; }
+        if (window.__alertSeen === undefined) { window.__alertSeen = signal.total; }  // skip alerts from before page load
+        if (signal.total > window.__alertSeen) {
+            window.__alertSeen = signal.total;
+            if (opts && opts.includes('browser') && window.Notification && Notification.permission === 'granted') {
+                new Notification('Candlestick alert', {body: signal.latest});
+            }
+        }
+        return window.dash_clientside.no_update;
+    }""",
+    Output('alert-sink-1', 'data'), Input('alert-signal', 'data'), State('alert-opts', 'value'))
+
+app.clientside_callback(
+    """function(opts) {
+        if (opts && opts.includes('browser') && window.Notification && Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
+        return window.dash_clientside.no_update;
+    }""",
+    Output('alert-sink-2', 'data'), Input('alert-opts', 'value'), prevent_initial_call=True)
 
 
 if __name__ == '__main__':

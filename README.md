@@ -46,9 +46,22 @@ The page shows:
 - trend and volume context: the move over the 10 candles before the pattern (up/down/sideways, measured in average candle ranges), the last candle's volume against its 20-candle average, and whether the pattern fits that trend (a bullish reversal after a downtrend fits; after an uptrend it goes against it);
 - the OHLCV table of those eight candles, so you can compare against Yahoo or your broker.
 - a **watchlist scanner**: enter up to 20 tickers (`AAPL, MSFT, TSLA`) and press **Scan** to see each one's current pattern, confidence, rule agreement and last candle, sorted by confidence. Rows where the model and the rule check agree are tinted green, and **Open** loads a ticker into the main view. It scans on the timeframe selected above, shows each ticker's trend, volume and context, and *Only signals that fit the trend* hides the rest. Tick *Auto-refresh* to rescan every 30 s. A bad or unknown ticker only affects its own row;
+- an **Alerts** card: set a minimum confidence, and whether the rules must agree and the signal must fit the trend. Matching signals appear in an alert feed and can also raise a browser notification or a Telegram message. Alerts fire only for *live* signals (never Replay or a closed market), once per candle, and only while the page is open (see **Alerts setup**);
 - a detection history (newest 10 rows) with a **Download CSV** button. Every new candle's prediction is appended to `logs/detections.csv` (time, ticker, mode, timeframe, close, model class and confidence, rule patterns, whether they agree), so you can review how the model behaved later. The `logs/` folder is git-ignored.
 
 Press `Ctrl+C` in the terminal to stop.
+
+### Alerts setup
+
+The feed and browser notifications work out of the box (tick *browser notification* and allow the permission prompt). For Telegram, create a bot with [@BotFather](https://t.me/BotFather), send it a message, find your chat id (for example via `https://api.telegram.org/bot<TOKEN>/getUpdates`), and set both variables before starting the app:
+
+```powershell
+$env:TELEGRAM_BOT_TOKEN = "123456:ABC..."
+$env:TELEGRAM_CHAT_ID = "123456789"
+uv run src/app.py
+```
+
+The token is read from the environment only and is never written to disk or the logs. Then tick *Telegram* in the Alerts card.
 
 ### How the prediction works
 
@@ -92,6 +105,7 @@ src/app.py                  Dash app: ticker input, chart, prediction, rule chec
 src/market.py               Yahoo Finance data and market status
 src/history.py              CSV log of every prediction
 src/context.py              trend and volume context for a signal
+src/alerts.py               alert rules, feed and Telegram delivery
 src/sessions.py             per-browser-tab state
 src/scanner.py              watchlist scan (parallel fetch, sequential inference)
 src/render.py               draws the 20-candle chart image the model expects

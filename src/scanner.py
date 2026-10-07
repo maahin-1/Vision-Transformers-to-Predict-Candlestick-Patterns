@@ -27,23 +27,26 @@ def parse_tickers(text):
     return tickers[:MAX_TICKERS], rejected, len(tickers) > MAX_TICKERS
 
 
-def analyze(ticker, df, predict_fn, timeframe=market.DEFAULT_TIMEFRAME):
-    """Prediction row for one ticker from its candle DataFrame."""
-    seconds = market.timeframe_seconds(timeframe)
-    closed = market.closed_only(df, seconds)
-    if len(closed) < render.N_CANDLES:
-        raise market.MarketDataError(f'only {len(closed)} closed candles')
-    data = closed.iloc[-render.N_CANDLES:]
-    image = render.render_chart(data['Open'], data['High'], data['Low'], data['Close'], render.training_style_times())
-    probs = predict_fn(image)
+def build_row(ticker, timeframe, closed, probs, df):
+    """Prediction row from closed candles and class probabilities. `df` is the full frame (for market state)."""
     top = max(range(len(probs)), key=probs.__getitem__)
     found = rules.detect_frame(closed)
-    state, age = market.market_status(df, seconds)
+    state, age = market.market_status(df, market.timeframe_seconds(timeframe))
     ctx = context.describe(closed, rules.CLASSES[top])
     return {'ticker': ticker, 'error': '', 'timeframe': timeframe, 'candle_time': closed['Datetime'].iloc[-1],
             'close': float(closed['Close'].iloc[-1]), 'prediction': rules.CLASSES[top], 'confidence': probs[top],
             'rules': found, 'agrees': rules.CLASSES[top] in found, 'market': state, 'age_min': age,
             'trend': ctx['trend'], 'volume': ctx['volume'], 'volume_ratio': ctx['volume_ratio'], 'fit': ctx['fit']}
+
+
+def analyze(ticker, df, predict_fn, timeframe=market.DEFAULT_TIMEFRAME):
+    """Prediction row for one ticker from its candle DataFrame."""
+    closed = market.closed_only(df, market.timeframe_seconds(timeframe))
+    if len(closed) < render.N_CANDLES:
+        raise market.MarketDataError(f'only {len(closed)} closed candles')
+    data = closed.iloc[-render.N_CANDLES:]
+    image = render.render_chart(data['Open'], data['High'], data['Low'], data['Close'], render.training_style_times())
+    return build_row(ticker, timeframe, closed, predict_fn(image), df)
 
 
 def _fetch(ticker, fetch, timeframe):
