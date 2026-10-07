@@ -19,6 +19,7 @@ from PIL import Image
 
 import alerts
 import context
+import explain
 import history
 import market
 import predictor
@@ -79,6 +80,9 @@ def _build_layout():
                 html.Div(id='context', style={'marginTop': '6px', 'fontSize': '14px'}),
                 html.Div('What the model sees', style={'fontWeight': 600, 'margin': '14px 0 6px'}),
                 html.Img(id='model-view', style={'imageRendering': 'pixelated', 'border': '1px solid #e5e7eb'}),
+            dcc.Checklist(id='show-heat', value=[], options=[{'label': ' Show attention heatmap', 'value': 'heat'}],
+                          style={'marginTop': '6px', 'fontSize': '14px'}),
+            html.Div(id='heat-note', style={'fontSize': '12px', 'color': '#6b7280', 'marginTop': '2px'}),
             ]),
         ]),
         html.Div(style={**CARD, 'marginTop': '14px', 'overflowX': 'auto'}, children=[
@@ -225,19 +229,40 @@ def _figure(visible):
     return fig
 
 
-def _predict(visible):
-    key = (S['ticker'], S['timeframe'], visible['Datetime'].iloc[-1])
-    if S['cache'][0] == key:
-        return S['cache'][1]
-    data = visible.iloc[-render.N_CANDLES:]
-    image = render.render_chart(data['Open'], data['High'], data['Low'], data['Close'], render.training_style_times())
-    probs = _infer(image)
-    view = Image.fromarray(predictor.model_view(image)).resize((216, 312), Image.Resampling.NEAREST)
+def _explain(image):
+    with _infer_lock:
+        return predictor.attention_heat(image)
+
+
+def _png_src(array):
     buf = io.BytesIO()
-    view.save(buf, format='PNG')
-    src = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
-    S['cache'] = (key, (probs, src))
-    return probs, src
+    Image.fromarray(array).save(buf, format='PNG')
+    return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+
+
+def _predict(visible, want_heat):
+    """Cached per candle: rendered chart, probabilities and (only when asked for) the attention heatmap."""
+    key = (S['ticker'], S['timeframe'], visible['Datetime'].iloc[-1])
+    entry = S['cache'][1] if S['cache'][0] == key else None
+    if entry is None:
+        data = visible.iloc[-render.N_CANDLES:]
+        image = render.render_chart(data['Open'], data['High'], data['Low'], data['Close'],
+                                    render.training_style_times())
+        entry = {'image': image, 'probs': _infer(image), 'view': predictor.model_view(image), 'heat': None}
+        S['cache'] = (key, entry)
+    if want_heat and entry['heat'] is None:
+        entry['heat'] = _explain(entry['image'])
+    return entry
+
+
+def _view_panel(entry, want_heat):
+    """(image src, note) for the 'What the model sees' card."""
+    if not want_heat:
+        return _png_src(explain.upscale(entry['view'])), ''
+    share = explain.recent_share(entry['heat'])
+    note = (f'{share:.0%} of the attention is on the right-most third of the crop (about the last 3 candles); '
+            f'an even spread would be 33%. Warmer = more weight.')
+    return _png_src(explain.overlay(entry['view'], entry['heat'])), note
 
 
 def _prediction_panel(probs):
@@ -300,18 +325,18 @@ def _history_table():
 
 def _message(text, interval):
     empty = go.Figure().update_layout(template='plotly_white', xaxis_visible=False, yaxis_visible=False)
-    return empty, html.Span(text, style={'color': '#b91c1c', 'fontWeight': 600}), '', '', '', '', '', interval, no_update
+    return empty, html.Span(text, style={'color': '#b91c1c', 'fontWeight': 600}), '', '', '', '', '', '', interval, no_update
 
 
 @app.callback(
     Output('chart', 'figure'), Output('status', 'children'), Output('prediction', 'children'),
     Output('rule-check', 'children'), Output('context', 'children'), Output('model-view', 'src'),
-    Output('table', 'children'), Output('tick', 'interval'), Output('history', 'children'),
+    Output('heat-note', 'children'), Output('table', 'children'), Output('tick', 'interval'), Output('history', 'children'),
     Input('tick', 'n_intervals'), Input('track-btn', 'n_clicks'), Input('ticker-input', 'n_submit'),
-    Input('mode', 'value'), Input('timeframe', 'value'), Input('open-ticker', 'data'),
+    Input('mode', 'value'), Input('timeframe', 'value'), Input('open-ticker', 'data'), Input('show-heat', 'value'),
     State('ticker-input', 'value'), State('sid', 'data'), State('alert-conf', 'value'), State('alert-opts', 'value'),
 )
-def refresh(_n, _clicks, _submit, mode, timeframe, opened, ticker_text, sid, alert_conf, alert_opts):
+def refresh(_n, _clicks, _submit, mode, timeframe, opened, show_heat, ticker_text, sid, alert_conf, alert_opts):
     with _lock:
         S.use(sid)
         interval = _poll_ms(timeframe) if mode == 'live' else REPLAY_MS
@@ -327,6 +352,8 @@ def refresh(_n, _clicks, _submit, mode, timeframe, opened, ticker_text, sid, ale
                 _start(ticker_text, mode, timeframe)
             elif S['df'] is None:  # last attempt failed; wait for the user instead of hammering Yahoo
                 return _message(S['error'], interval)
+            elif trigger == 'show-heat':
+                pass
             elif mode == 'replay':
                 S['cursor'] = min(S['cursor'] + 1, len(S['df']))
             elif time.monotonic() - S['fetched'] > interval / 1000 - 1:
@@ -337,7 +364,10 @@ def refresh(_n, _clicks, _submit, mode, timeframe, opened, ticker_text, sid, ale
             visible = _visible()
             if len(visible) < render.N_CANDLES:
                 return _message(f'Only {len(visible)} closed candles so far; need {render.N_CANDLES}.', interval)
-            probs, src = _predict(visible)
+            want_heat = 'heat' in (show_heat or [])
+            entry = _predict(visible, want_heat)
+            probs = entry['probs']
+            src, heat_note = _view_panel(entry, want_heat)
         except market.MarketDataError as exc:
             S.update(df=None, error=str(exc))
             return _message(str(exc), interval)
@@ -351,7 +381,7 @@ def refresh(_n, _clicks, _submit, mode, timeframe, opened, ticker_text, sid, ale
         if S['mode'] == 'live':  # replayed candles are not real signals
             _notify([scanner.build_row(S['ticker'], S['timeframe'], visible, probs, S['df'])], alert_conf, alert_opts)
         return (_figure(visible), _status(visible), panel, _rule_panel(found, top_class),
-                _context_panel(visible, top_class), src, _table(visible), interval, _history_table())
+                _context_panel(visible, top_class), src, heat_note, _table(visible), interval, _history_table())
 
 
 @app.callback(Output('export-download', 'data'), Input('export-btn', 'n_clicks'), prevent_initial_call=True)

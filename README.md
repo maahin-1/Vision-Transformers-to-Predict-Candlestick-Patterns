@@ -42,7 +42,7 @@ The page shows:
 - the candlestick chart, with the eight candles the model reads highlighted;
 - the model's probability for each class (a "weak" tag appears below 50%);
 - a rule check, using textbook OHLC definitions, saying whether it agrees with the model;
-- "What the model sees", the exact 72 x 104 px crop fed to the network;
+- "What the model sees", the exact 72 x 104 px crop fed to the network, with an optional **attention heatmap** (warmer = the patch mattered more to the class token) and a note on how much attention falls on the newest candles;
 - trend and volume context: the move over the 10 candles before the pattern (up/down/sideways, measured in average candle ranges), the last candle's volume against its 20-candle average, and whether the pattern fits that trend (a bullish reversal after a downtrend fits; after an uptrend it goes against it);
 - the OHLCV table of those eight candles, so you can compare against Yahoo or your broker.
 - a **watchlist scanner**: enter up to 20 tickers (`AAPL, MSFT, TSLA`) and press **Scan** to see each one's current pattern, confidence, rule agreement and last candle, sorted by confidence. Rows where the model and the rule check agree are tinted green, and **Open** loads a ticker into the main view. It scans on the timeframe selected above, shows each ticker's trend, volume and context, and *Only signals that fit the trend* hides the rest. Tick *Auto-refresh* to rescan every 30 s. A bad or unknown ticker only affects its own row;
@@ -50,6 +50,10 @@ The page shows:
 - a detection history (newest 10 rows) with a **Download CSV** button. Every new candle's prediction is appended to `logs/detections.csv` (time, ticker, mode, timeframe, close, model class and confidence, rule patterns, whether they agree), so you can review how the model behaved later. The `logs/` folder is git-ignored.
 
 Press `Ctrl+C` in the terminal to stop.
+
+### Attention heatmap
+
+Tick *Show attention heatmap* under "What the model sees". It uses attention rollout (`src/explain.py`): the attention heads are averaged, the residual connections added, and the three encoder layers multiplied together, giving the class token's weight on each 8 x 8 patch. It is computed on demand and the model is not modified. On generated patterns about 60-80% of the attention lands on the right-most third of the crop, i.e. the newest candles, which is where these patterns are defined. Treat it as an indication of where the model looks, not proof of why it decided.
 
 ### Alerts setup
 
@@ -106,6 +110,7 @@ src/market.py               Yahoo Finance data and market status
 src/history.py              CSV log of every prediction
 src/context.py              trend and volume context for a signal
 src/alerts.py               alert rules, feed and Telegram delivery
+src/explain.py              attention-rollout heatmap
 src/sessions.py             per-browser-tab state
 src/scanner.py              watchlist scan (parallel fetch, sequential inference)
 src/render.py               draws the 20-candle chart image the model expects

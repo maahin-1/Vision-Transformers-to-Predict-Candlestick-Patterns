@@ -5,6 +5,7 @@ import albumentations as A
 import numpy as np
 import torch
 
+import explain
 from model import ViT
 from rules import CLASSES  # noqa: F401  (re-exported for callers)
 
@@ -44,3 +45,10 @@ def predict(image):
     tensor = _transform(image=np.ascontiguousarray(image))['image']
     with torch.inference_mode():
         return torch.softmax(model(tensor.unsqueeze(0)), dim=1)[0].tolist()
+
+
+def attention_heat(image):
+    """(13, 9) attention-rollout heatmap in [0, 1] for the same input as predict()."""
+    model = load_model()
+    tensor = _transform(image=np.ascontiguousarray(image))['image']
+    return explain.rollout_heat(explain.layer_attentions(model, tensor))
