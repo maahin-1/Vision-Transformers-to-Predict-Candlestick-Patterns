@@ -1,6 +1,6 @@
 # Vision Transformers to Predict Candlestick Patterns
 
-A Vision Transformer (ViT) that recognises candlestick patterns on a live stock chart. Type a ticker, and the app pulls 1-minute candles from Yahoo Finance, draws the last 20 as a chart, and classifies the most recent eight candles. A plain-OHLC rule check runs beside the model so you can see when they disagree.
+A Vision Transformer (ViT) that recognises candlestick patterns on live stock charts. Type a ticker, pick a timeframe, and the app pulls candles from Yahoo Finance, draws the last 20 as a chart, and classifies the most recent eight. A plain-OHLC rule check runs beside the model so you can see when they disagree. On top of that it has a watchlist scanner, trend and volume context, alerts, an attention heatmap and a detection history log.
 
 **Patterns detected:** doji, bullish engulfing, bearish engulfing, morning star, evening star.
 
@@ -44,7 +44,7 @@ The page shows:
 - a rule check, using textbook OHLC definitions, saying whether it agrees with the model;
 - "What the model sees", the exact 72 x 104 px crop fed to the network, with an optional **attention heatmap** (warmer = the patch mattered more to the class token) and a note on how much attention falls on the newest candles;
 - trend and volume context: the move over the 10 candles before the pattern (up/down/sideways, measured in average candle ranges), the last candle's volume against its 20-candle average, and whether the pattern fits that trend (a bullish reversal after a downtrend fits; after an uptrend it goes against it);
-- the OHLCV table of those eight candles, so you can compare against Yahoo or your broker.
+- the OHLCV table of those eight candles, so you can compare against Yahoo or your broker;
 - a **watchlist scanner**: enter up to 20 tickers (`AAPL, MSFT, TSLA`) and press **Scan** to see each one's current pattern, confidence, rule agreement and last candle, sorted by confidence. Rows where the model and the rule check agree are tinted green, and **Open** loads a ticker into the main view. It scans on the timeframe selected above, shows each ticker's trend, volume and context, and *Only signals that fit the trend* hides the rest. Tick *Auto-refresh* to rescan every 30 s. A bad or unknown ticker only affects its own row;
 - an **Alerts** card: set a minimum confidence, and whether the rules must agree and the signal must fit the trend. Matching signals appear in an alert feed and can also raise a browser notification or a Telegram message. Alerts fire only for *live* signals (never Replay or a closed market), once per candle, and only while the page is open (see **Alerts setup**);
 - a detection history (newest 10 rows) with a **Download CSV** button. Every new candle's prediction is appended to `logs/detections.csv` (time, ticker, mode, timeframe, close, model class and confidence, rule patterns, whether they agree), so you can review how the model behaved later. The `logs/` folder is git-ignored.
@@ -71,11 +71,30 @@ The token is read from the environment only and is never written to disk or the 
 
 The model was trained on screenshots of a Plotly chart showing 20 candles. The app draws the same kind of picture from the candle data (`src/render.py`) and runs it through the same resize and crop as training, so it does not read your screen and does not depend on window position. On 150 freshly generated pattern charts the rendered images were classified 100% correctly; the model scores 99.5% on its own labelled test screenshots.
 
+### Project status
+
+This is a finished v1 of an educational project. What was verified:
+
+- the renderer reproduces the training look (150/150 generated patterns correct) and the model scores 99.5% on its own labelled screenshots;
+- the app, scanner, timeframes, history log, CSV export, per-tab state and heatmap were exercised in a real browser;
+- unit tests (`uv run pytest`) run in CI on every push.
+
+What was **not** verified against the real services: Telegram delivery (tested with a mocked HTTP call only), browser notification pop-ups, and live-market alerts (built and tested while the market was closed, using synthetic live rows). A first live session is the real test.
+
 ### Caveats
 
 - The training data is synthetic (randomly generated candles shaped into each pattern), so real markets can give confident but wrong answers. Check the rule row and the table.
 - The model has no "no pattern" class. It always picks one of the five.
 - Educational project, not financial advice.
+
+## Possible next steps
+
+Ideas that were scoped but not built, roughly in order of value:
+
+1. **Fix the overconfidence.** Add a "no pattern" class and retrain with real candles auto-labelled by `src/rules.py`, mixed with the synthetic set. This is the biggest accuracy gain.
+2. **Backtest page.** Measure how often each pattern was followed by the expected move, against a baseline, to find out whether the signals are useful at all.
+3. More patterns (hammer, shooting star, harami, three white soldiers), a paper-trading replay with an equity curve, and a comparison with a classic model on raw OHLC features.
+4. A Dockerfile, and moving `data/` (51 MB) out of git into a release asset.
 
 ## Optional: screen-capture predictor
 
